@@ -1,0 +1,164 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<iostream>
+
+//cuda的一些头文件
+#include <cuda.h>
+#include <curand_kernel.h>
+#include<cuda_runtime_api.h>
+#include "device_launch_parameters.h"
+//																	实现卷积操作
+
+//如何得到错误          用这个函数可以得到错误    几乎所有的函数的返回值都是error 所以都可以套上这个函数去得到它的错误
+static void HandleError(cudaError_t err, const char* file, int line)
+{
+	if (err != cudaSuccess)
+	{
+		printf("%s in %s at line %d\n", cudaGetErrorString(err), file, line);
+		exit(EXIT_FAILURE);
+	}
+}
+//之所以添加这个宏定义 是因为参数太多太麻烦 直接使用默认参数为后面两个参数赋值 所以之后调用只需要一个输入参数 也就是 cudaMalloc 返回的一个指针
+#define HANDLE_ERROR(err) (HandleError(err,__FILE__,__LINE__))
+
+//得到本机的线程数
+int getThreadNum()
+{
+	cudaDeviceProp prop;
+	int count;
+	HANDLE_ERROR(cudaGetDeviceCount(&count));  //通过这个函数可以得到本机有多少个GPU
+	printf("gpu num: %d\n", count);
+	HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));			//用这个函数得到GPU的一些参数   第二个参数代表的意思是：gpu的编号 如在本机中 就是第0号gpu 可以使用i来打印每个gpu信息
+	printf("maxThreadsPerBlock: %d\n", prop.maxThreadsPerBlock);
+	printf("maxGridSize: %d %d %d\n", prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);					//因为grid是三维的 所以可以打出3个数据出来
+	return prop.maxThreadsPerBlock; //本函数的作用：得到本机线程数
+}
+
+//实现卷积函数 因为是在设备上的 所以要加global
+__global__ void conv(float* img, float* kernel,float* result,int width,int height,int kernelSize)
+{
+	int ti = threadIdx.x;
+	int bi = blockIdx.x;
+	int id = (bi * blockIdx.x + ti);
+	int row = id / width;
+	int col = id % width;
+
+	//保护机制 防止溢出
+	if (id >= width * height)
+	{
+		return;
+	}
+
+	//卷积核开始遍历
+	for (int i = 0; i < kernelSize; ++i)
+	{
+		for (int j = 0; j < kernelSize; ++j)
+		{
+			float imgValue = 0;
+			int curRow = row - kernelSize / 2 + i;
+			int curCol = col - kernelSize / 2 + j;
+			if (curRow < 0 || curCol < 0 || curRow >= height || curCol >= width)
+			{
+
+			}
+			else
+			{
+				imgValue = img[curRow * width + curCol];
+			}
+			result[id] += kernel[i * kernelSize + j] * imgValue;
+		}
+	}
+
+}
+
+
+int main()
+{
+	//做卷积操作
+	//首先定义一副图的宽高
+	int width = 10;
+	int height = 10;
+	float* img = new float[width * height];//这样就生成了一幅图片
+
+	//初始化图
+	for (int row = 0; row < height; ++row)
+	{
+		for (int col = 0; col < width; ++col)
+		{
+			img[col + row * width] = (col + row) % 256;
+		}
+	}
+
+	//定义卷积核大小
+	int kernelSize = 3;
+	float* kernel = new float[kernelSize * kernelSize];	//3*3的卷积核			//注意这里 c++里 不能用变量去定义数组
+	
+	for (int i = 0; i < kernelSize * kernelSize; ++i)
+	{
+		kernel[i] = i % kernelSize - 1; //使得里面的数字只有 1 0 -1
+	}
+
+	//定义gpu要用的数据
+	float* imgGpu;		
+	float* kernelGpu;		//gpu上的卷积核
+	float* resultGpu;
+	
+
+	//给gpu上的数据分配空间
+	HANDLE_ERROR(cudaMalloc((void**)&imgGpu, width * height * sizeof(float)));
+	HANDLE_ERROR(cudaMalloc((void**)&kernelGpu, kernelSize*kernelSize * sizeof(float)));		//注意这里卷积核的大小 有它自己的大小
+	HANDLE_ERROR(cudaMalloc((void**)&resultGpu, width * height * sizeof(float)));
+
+	//把内存上的数据拷贝给显存  同样可以外部套用错误函数得到它的错误信息
+	HANDLE_ERROR(cudaMemcpy(imgGpu, img,width * height * sizeof(float), cudaMemcpyHostToDevice));
+	HANDLE_ERROR(cudaMemcpy(kernelGpu, kernel, kernelSize * kernelSize * sizeof(float), cudaMemcpyHostToDevice));
+
+	//先看看最大能开多少的线程
+	int	threadNum = getThreadNum();//1024        因为1080大于1024 所以 在这里我们需要切割
+
+	//切割       计算出需要多少个block
+	int	blockNum =( width * height - 0.5) / threadNum + 1;  //这里-0.5是一个技巧 防止它刚好整除了  
+
+	//do    函数
+	conv << <blockNum, threadNum >> > (imgGpu, kernelGpu, resultGpu, width, height, kernelSize);
+
+	//把显存上的数据拷贝到内存
+	float* result = new float[width * height];
+	HANDLE_ERROR(cudaMemcpy(result,resultGpu, width * height * sizeof(float), cudaMemcpyDeviceToHost));
+
+	//打印图片来看看
+	printf("img\n");
+	for (int row = 0; row < 10; ++row)
+	{
+		for (int col = 0; col < 10; ++col)
+		{
+			printf("%2.0f ", img[col + row * width]);
+		}
+		printf("\n");
+	}
+
+	printf("kernel\n");
+	for (int row = 0; row < kernelSize; ++row)
+	{
+		for (int col = 0; col < kernelSize; ++col)
+		{
+			printf("%2.0f ", kernel[col + row * kernelSize]);
+		}
+		printf("\n");
+	}
+	for (int i = 0; i < kernelSize * kernelSize; ++i)
+	{
+		printf("%2.0f ", kernel[i]);
+	}
+
+	printf("\nresult\n");
+	for (int row = 0; row < 10; ++row)
+	{
+		for (int col = 0; col < 10; ++col)
+		{
+			printf("%2.0f ", result[col + row * width]);
+		}
+		printf("\n");
+	}
+	return 0;
+}
