@@ -1,0 +1,93 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<iostream>
+
+//cuda的一些头文件
+#include <cuda.h>
+#include <curand_kernel.h>
+#include<cuda_runtime_api.h>
+#include "device_launch_parameters.h"
+#include "device_functions.h"
+#include "cuda_runtime_api.h"
+
+//如何得到错误          用这个函数可以得到错误    几乎所有的函数的返回值都是error 所以都可以套上这个函数去得到它的错误
+static void HandleError(cudaError_t err, const char* file, int line)
+{
+	if (err != cudaSuccess)
+	{
+		printf("%s in %s at line %d\n", cudaGetErrorString(err), file, line);
+		exit(EXIT_FAILURE);
+	}
+}
+//之所以添加这个宏定义 是因为参数太多太麻烦 直接使用默认参数为后面两个参数赋值 所以之后调用只需要一个输入参数 也就是 cudaMalloc 返回的一个指针
+#define HANDLE_ERROR(err) (HandleError(err,__FILE__,__LINE__))
+
+//写设备上的函数
+__global__ void sum(float* aGpu, float* retGpu)
+{
+	int id = threadIdx.x;
+
+	//因为要让一个块内所有线程用同一个数据 所以要定义共享数据
+	__shared__ float data[16];
+	//把每一个数值赋给这个共享的数据
+	data[id] = aGpu[id];
+
+	//要等待全部线程 都一一对应的给data赋值结束 所以这里要栅栏同步  在#include "device_functions.h" 里面  飘红是因为感知不到 并不是没有
+	__syncthreads();
+
+	//开始做归约运算
+	for (int i = 8; i > 0; i /= 2)
+	{
+		if (id < i)
+		{
+			data[id] = data[id] + data[id + i];
+		}
+		//这里要等全部线程都运算完 所以栅栏同步
+		__syncthreads();
+	}
+	//得到结果
+	if (id == 0)  //这里因为前面有同步 所以只让一个线程进行输出赋值即可 而不需要所有线程来赋值
+	{
+		retGpu[0] = data[0];  //这里尽管retGpu是一个数，但是还是要用[0]
+	}
+}
+
+int main()
+{
+	//本程序实现16位数组求和
+
+	//先定义一个16位数组
+	float a[16];
+	//赋初始值
+	for (int i = 0; i < 16; ++i)
+	{
+		a[i] = i * (i + 1);
+	}
+
+	//定义在GPU上跑的数组 和 最后得到结果的数(注意 这个结果是从GPU上得到的)
+	float *aGpu;
+	float *retGpu;
+
+	//给他们分配显存
+	HANDLE_ERROR(cudaMalloc((void**)&aGpu, 16 * sizeof(float)));
+	HANDLE_ERROR(cudaMalloc((void**)&retGpu, 1 * sizeof(float)));
+
+	//把内存上的数据拷贝给显存
+	HANDLE_ERROR(cudaMemcpy(aGpu, a,16 * sizeof(float), cudaMemcpyHostToDevice));
+
+	//调用设备上的函数sum
+	sum << <1, 16 >> > (aGpu, retGpu);
+
+	//定义内存上的结果数据
+	float b[1];   //注意这里要为一个指针  上面之所以不用 是因为数值本身就是一个指针  还是要定义成一个数组，尽管里面只有一个数
+
+	//把显存上的结果拷贝回内存上的结果数据
+	HANDLE_ERROR(cudaMemcpy(b, retGpu, 1 * sizeof(float), cudaMemcpyDeviceToHost));
+
+	//打印结果
+	printf("b= %f \n", b[0]);
+  
+	return 0;
+}
+
+
